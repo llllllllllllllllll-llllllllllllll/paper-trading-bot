@@ -42,9 +42,25 @@ INTERVAL      = "1h"
 CANDLE_LIMIT  = 300
 MIN_LOOKBACK  = 120
 
-# Using Bybit public API — no geo-restrictions, no API key needed
-BYBIT_KLINES_URL  = "https://api.bybit.com/v5/market/kline"
-BYBIT_TICKER_URL  = "https://api.bybit.com/v5/market/tickers"
+# Using yfinance — works from GitHub Actions, no API key, no geo-restrictions
+# yfinance symbol format: BTC-USDT (dash separated)
+YFINANCE_SYMBOL_MAP = {
+    "BTCUSDT": "BTC-USD",
+    "ETHUSDT": "ETH-USD",
+    "SOLUSDT": "SOL-USD",
+    "BNBUSDT": "BNB-USD",
+    "LINKUSDT": "LINK-USD",
+    "AVAXUSDT": "AVAX-USD",
+    "MATICUSDT": "MATIC-USD",
+    "ATOMUSDT": "ATOM-USD",
+    "LTCUSDT": "LTC-USD",
+    "DOGEUSDT": "DOGE-USD",
+    "APTUSDT": "APT-USD",
+    "ARBUSDT": "ARB-USD",
+    "OPUSDT": "OP-USD",
+    "NEARUSDT": "NEAR-USD",
+    "FILUSDT": "FIL-USD",
+}
 
 STATE_PATH = Path(os.getenv("STATE_FILE", "state.json"))
 
@@ -131,16 +147,15 @@ def update_drawdown_state(state: Dict[str, Any]) -> Tuple[float, float]:
 # ==============================
 
 def get_live_price(symbol: str, fallback: float) -> float:
-    """Fetch real current price from Bybit public API — no geo-restrictions."""
+    """Fetch latest price via yfinance — works everywhere."""
+    import yfinance as yf
     try:
-        r = requests.get(
-            BYBIT_TICKER_URL,
-            params={"category": "linear", "symbol": symbol},
-            timeout=5,
-        )
-        data = r.json()
-        if data.get("retCode") == 0:
-            return float(data["result"]["list"][0]["lastPrice"])
+        yf_symbol = YFINANCE_SYMBOL_MAP.get(symbol, symbol)
+        ticker = yf.Ticker(yf_symbol)
+        data = ticker.fast_info
+        price = float(data.last_price)
+        if price and price > 0:
+            return price
     except Exception:
         pass
     return fallback
@@ -151,47 +166,45 @@ def get_live_price(symbol: str, fallback: float) -> float:
 # ==============================
 
 def fetch_asset_klines(symbol: str) -> pd.DataFrame:
+    import yfinance as yf
     import time
-    logger.info("Fetching %s candles for %s", INTERVAL, symbol)
-    # Bybit uses different interval format
-    interval_map = {"1h": "60", "4h": "240", "1d": "D"}
-    bybit_interval = interval_map.get(INTERVAL, "60")
-    rows = []
+    logger.info("Fetching 1h candles for %s via yfinance", symbol)
+    yf_symbol = YFINANCE_SYMBOL_MAP.get(symbol, symbol)
     for attempt in range(5):
         try:
-            r = requests.get(
-                BYBIT_KLINES_URL,
-                params={
-                    "category": "linear",
-                    "symbol": symbol,
-                    "interval": bybit_interval,
-                    "limit": CANDLE_LIMIT,
-                },
-                timeout=30,
+            df = yf.download(
+                yf_symbol,
+                period="30d",
+                interval="1h",
+                auto_adjust=True,
+                progress=False,
             )
-            data = r.json()
-            if data.get("retCode") == 0:
-                raw = data["result"]["list"]
-                # Bybit returns newest first — reverse it
-                raw = list(reversed(raw))
-                if len(raw) >= MIN_LOOKBACK:
-                    rows = raw
-                    break
-            logger.warning("Attempt %d for %s: %s", attempt+1, symbol, str(data)[:120])
-            time.sleep(2)
+            if df is not None and len(df) >= MIN_LOOKBACK:
+                df = df.reset_index()
+                df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+                df = df.rename(columns={
+                    "Datetime": "timestamp",
+                    "Open": "open",
+                    "High": "high",
+                    "Low": "low",
+                    "Close": "close",
+                    "Volume": "volume",
+                })
+                df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+                df["close_time"] = df["timestamp"] + pd.Timedelta(hours=1) - pd.Timedelta(milliseconds=1)
+                df = df[["timestamp", "open", "high", "low", "close", "volume", "close_time"]].copy()
+                for col in ["open", "high", "low", "close", "volume"]:
+                    df[col] = pd.to_numeric(df[col])
+                logger.info("Fetched %d candles for %s", len(df), symbol)
+                return df
+            logger.warning("Attempt %d for %s: got %d rows", attempt+1, symbol, len(df) if df is not None else 0)
+            time.sleep(3)
         except Exception as e:
             logger.warning("Attempt %d for %s failed: %s", attempt+1, symbol, e)
-            time.sleep(2)
-    if not rows:
-        raise RuntimeError(f"{symbol} could not be fetched from Bybit.")
+            time.sleep(3)
+    raise RuntimeError(f"{symbol} could not be fetched after 5 attempts.")
 
-    # Bybit kline columns: [startTime, openPrice, highPrice, lowPrice, closePrice, volume, turnover]
-    df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume", "turnover"])
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = pd.to_numeric(df[col])
-    df["timestamp"] = pd.to_datetime(df["timestamp"].astype("int64"), unit="ms", utc=True)
-    df["close_time"] = df["timestamp"] + pd.Timedelta(hours=1) - pd.Timedelta(milliseconds=1)
-    return df[["timestamp", "open", "high", "low", "close", "volume", "close_time"]]
+
 
 
 def prepare_asset(df: pd.DataFrame) -> pd.DataFrame:
