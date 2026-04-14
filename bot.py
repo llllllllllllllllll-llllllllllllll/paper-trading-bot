@@ -143,15 +143,28 @@ def get_live_price(symbol: str, fallback: float) -> float:
 # ==============================
 
 def fetch_asset_klines(symbol: str) -> pd.DataFrame:
+    import time
     logger.info("Fetching %s candles for %s", INTERVAL, symbol)
-    r = requests.get(
-        BINANCE_KLINES_URL,
-        params={"symbol": symbol, "interval": INTERVAL, "limit": CANDLE_LIMIT},
-        timeout=15,
-    )
-    rows = r.json()
-    if len(rows) < MIN_LOOKBACK:
-        raise RuntimeError(f"{symbol} returned only {len(rows)} candles.")
+    headers = {"User-Agent": "Mozilla/5.0"}
+    rows = []
+    for attempt in range(5):
+        try:
+            r = requests.get(
+                BINANCE_KLINES_URL,
+                params={"symbol": symbol, "interval": INTERVAL, "limit": CANDLE_LIMIT},
+                headers=headers,
+                timeout=30,
+            )
+            rows = r.json()
+            if isinstance(rows, list) and len(rows) >= MIN_LOOKBACK:
+                break
+            logger.warning("Attempt %d: %s returned %s rows, retrying...", attempt+1, symbol, len(rows) if isinstance(rows, list) else "error")
+            time.sleep(3 * (attempt + 1))
+        except Exception as e:
+            logger.warning("Attempt %d failed for %s: %s", attempt+1, symbol, e)
+            time.sleep(3 * (attempt + 1))
+    if not isinstance(rows, list) or len(rows) < MIN_LOOKBACK:
+        raise RuntimeError(f"{symbol} returned only {len(rows) if isinstance(rows, list) else 0} candles after retries.")
 
     df = pd.DataFrame(rows, columns=[
         "timestamp", "open", "high", "low", "close", "volume",
@@ -202,12 +215,14 @@ def prepare_asset(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_market_data() -> Tuple[Dict[str, pd.DataFrame], pd.Timestamp]:
+    import time
     raw_data: Dict[str, pd.DataFrame] = {}
     prepared_data: Dict[str, pd.DataFrame] = {}
 
     for symbol in ASSETS:
         raw_data[symbol] = fetch_asset_klines(symbol)
         prepared_data[symbol] = prepare_asset(raw_data[symbol])
+        time.sleep(0.5)  # avoid Binance rate limiting
 
     master = prepared_data["BTCUSDT"]["timestamp"]
     for symbol in ASSETS:
