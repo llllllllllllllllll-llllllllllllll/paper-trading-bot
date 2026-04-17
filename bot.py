@@ -42,8 +42,6 @@ INTERVAL      = "1h"
 CANDLE_LIMIT  = 300
 MIN_LOOKBACK  = 120
 
-# CryptoCompare public API — works from GitHub Actions, no geo-restrictions
-# Maps our symbol to CryptoCompare base coin
 CC_SYMBOL_MAP = {
     "BTCUSDT": "BTC",
     "ETHUSDT": "ETH",
@@ -206,7 +204,6 @@ def fetch_asset_klines(symbol: str) -> pd.DataFrame:
         raise RuntimeError(f"{symbol} could not be fetched from CryptoCompare.")
 
     df = pd.DataFrame(rows)
-    # CryptoCompare columns: time, open, high, low, close, volumefrom, volumeto
     df = df.rename(columns={
         "time": "timestamp",
         "open": "open",
@@ -221,8 +218,6 @@ def fetch_asset_klines(symbol: str) -> pd.DataFrame:
         df[col] = pd.to_numeric(df[col])
     logger.info("Fetched %d candles for %s", len(df), symbol)
     return df[["timestamp", "open", "high", "low", "close", "volume", "close_time"]]
-
-
 
 
 def prepare_asset(df: pd.DataFrame) -> pd.DataFrame:
@@ -269,7 +264,7 @@ def build_market_data() -> Tuple[Dict[str, pd.DataFrame], pd.Timestamp]:
     for symbol in ASSETS:
         raw_data[symbol] = fetch_asset_klines(symbol)
         prepared_data[symbol] = prepare_asset(raw_data[symbol])
-        time.sleep(0.5)  # avoid Binance rate limiting
+        time.sleep(0.5)
 
     master = prepared_data["BTCUSDT"]["timestamp"]
     for symbol in ASSETS:
@@ -337,7 +332,7 @@ def entry_signal(df: pd.DataFrame, index: int) -> bool:
 
 
 # ==============================
-# PAPER EXITS  (replaces place_market_sell)
+# PAPER EXITS
 # ==============================
 
 def process_exits(state: Dict[str, Any], data: Dict[str, pd.DataFrame], index: int) -> None:
@@ -363,7 +358,6 @@ def process_exits(state: Dict[str, Any], data: Dict[str, pd.DataFrame], index: i
         if float(row["low"]) > trailing:
             continue
 
-        # PAPER: simulate exit at live price with slippage
         exit_price = get_live_price(symbol, float(row["close"])) * (1 - SLIPPAGE)
         avg_entry = float(position.get("avg_entry", position["entry"]))
         qty = float(position["size"])
@@ -380,7 +374,7 @@ def process_exits(state: Dict[str, Any], data: Dict[str, pd.DataFrame], index: i
 
 
 # ==============================
-# PAPER ENTRIES  (replaces place_market_buy)
+# PAPER ENTRIES
 # ==============================
 
 def process_entries(state: Dict[str, Any], data: Dict[str, pd.DataFrame], index: int, equity_ma: float) -> None:
@@ -419,7 +413,6 @@ def process_entries(state: Dict[str, Any], data: Dict[str, pd.DataFrame], index:
         if stop_distance <= 0:
             continue
 
-        # PAPER: simulate entry at live price with slippage
         entry_price = get_live_price(symbol, float(row["close"])) * (1 + SLIPPAGE)
         stop_price = entry_price - stop_distance
         size = trade_risk / stop_distance
@@ -444,7 +437,7 @@ def process_entries(state: Dict[str, Any], data: Dict[str, pd.DataFrame], index:
 
 
 # ==============================
-# PAPER PYRAMIDING  (replaces place_market_buy for adds)
+# PAPER PYRAMIDING
 # ==============================
 
 def process_pyramiding(state: Dict[str, Any], data: Dict[str, pd.DataFrame], index: int, equity_ma: float) -> None:
@@ -483,7 +476,6 @@ def process_pyramiding(state: Dict[str, Any], data: Dict[str, pd.DataFrame], ind
         if stop_distance <= 0:
             continue
 
-        # PAPER: simulate pyramid add at live price
         add_price = get_live_price(symbol, float(row["close"])) * (1 + SLIPPAGE)
         new_size = trade_risk / stop_distance
         current_size = float(position["size"])
@@ -517,7 +509,6 @@ def print_report(state: Dict[str, Any], data: Dict[str, pd.DataFrame], index: in
     max_dd = float(state["max_drawdown"]) * 100
     trades = int(state["trade_count"])
 
-    # Unrealised PnL on open positions using live prices
     open_lines = []
     unrealised_total = 0.0
     for symbol, pos in state["positions"].items():
@@ -537,7 +528,7 @@ def print_report(state: Dict[str, Any], data: Dict[str, pd.DataFrame], index: in
 
     sep = "=" * 52
     print(f"\n{sep}")
-    print(f"  📊 PAPER TRADING REPORT  —  {utc_now().strftime('%Y-%m-%d %H:%M UTC')}")
+    print(f"  PAPER TRADING REPORT  —  {utc_now().strftime('%Y-%m-%d %H:%M UTC')}")
     print(sep)
     print(f"  Starting Balance  : ${INITIAL_CAPITAL:>10.2f}")
     print(f"  Realised Equity   : ${equity:>10.2f}  ({sign_pnl}{pnl_pct:.2f}%)")
