@@ -548,48 +548,76 @@ def print_report(state: Dict[str, Any],
 
 
 # ==============================
-# MISSED CANDLE CATCHUP
+# CANDLE TRAVERSAL + CATCHUP
 # ==============================
 
-def get_missed_candles(
+def find_start_index(
     data: Dict[str, pd.DataFrame],
     last_processed: Optional[str],
     latest_closed_timestamp: pd.Timestamp,
-) -> list:
+) -> int:
     """
-    Return every candle timestamp that was missed between
-    last_processed (exclusive) and latest_closed_timestamp (inclusive).
+    Traverse backwards through BTC candles to find the index
+    immediately after last_processed_candle.
+
+    Logic
+    -----
+    1. Get all candle timestamps up to latest_closed_timestamp.
+    2. Walk backwards one by one.
+    3. Stop when a candle timestamp equals last_processed.
+    4. Return the index of the candle AFTER that match
+       — that is the first candle we need to process.
+
+    If last_processed is None (fresh start), return the first
+    candle index that satisfies MIN_LOOKBACK.
     """
+    btc_df     = data["BTCUSDT"]
+    timestamps = btc_df["timestamp"]
+
+    # find the index of latest_closed_timestamp
+    latest_idx_arr = btc_df.index[timestamps == latest_closed_timestamp]
+    if len(latest_idx_arr) == 0:
+        raise RuntimeError("latest_closed_timestamp not found in BTC data.")
+    latest_idx = int(latest_idx_arr[0])
+
+    # fresh start — no previous candle recorded
     if last_processed is None:
-        return [latest_closed_timestamp]
+        logger.info("No previous candle found. Starting from MIN_LOOKBACK.")
+        return MIN_LOOKBACK
 
-    last_ts        = pd.Timestamp(last_processed)
-    btc_timestamps = data["BTCUSDT"]["timestamp"]
+    last_ts = pd.Timestamp(last_processed)
 
-    missed = btc_timestamps[
-        (btc_timestamps > last_ts) &
-        (btc_timestamps <= latest_closed_timestamp)
-    ].tolist()
+    # traverse backwards from latest_idx to find last_processed
+    for idx in range(latest_idx, -1, -1):
+        if timestamps.iloc[idx] == last_ts:
+            # found it — next candle is idx+1
+            start = idx + 1
+            logger.info(
+                "Found last_processed at index %d (%s). "
+                "Starting catchup from index %d.",
+                idx, last_processed, start,
+            )
+            return start
 
-    return missed
+    # last_processed is older than all fetched candles
+    # (e.g. bot was offline for >300 hours)
+    logger.warning(
+        "last_processed (%s) not found in fetched candle window. "
+        "Starting from MIN_LOOKBACK.",
+        last_processed,
+    )
+    return MIN_LOOKBACK
 
 
 def process_single_candle(
     state: Dict[str, Any],
     data: Dict[str, pd.DataFrame],
-    candle_timestamp: pd.Timestamp,
+    candle_index: int,
 ) -> None:
-    """Run exits → entries → pyramiding for one candle timestamp."""
-    candle_iso = candle_timestamp.isoformat()
+    """Run exits → entries → pyramiding for one candle index."""
+    candle_ts  = data["BTCUSDT"]["timestamp"].iloc[candle_index]
+    candle_iso = candle_ts.isoformat()
 
-    index_arr = data["BTCUSDT"].index[
-        data["BTCUSDT"]["timestamp"] == candle_timestamp
-    ]
-    if len(index_arr) == 0:
-        logger.warning("Candle %s not found in data, skipping.", candle_iso)
-        return
-
-    candle_index = int(index_arr[0])
     if candle_index < MIN_LOOKBACK:
         logger.warning(
             "Candle index %d below lookback %d, skipping.",
@@ -624,7 +652,6 @@ def main() -> None:
     data, latest_closed_timestamp = build_market_data()
     latest_closed_iso = latest_closed_timestamp.isoformat()
     last_processed    = state.get("last_processed_candle")
-    last_attempted    = state.get("last_attempted_candle")
 
     # ── already fully up to date ─────────────────────────────────────────
     if last_processed == latest_closed_iso:
@@ -635,40 +662,40 @@ def main() -> None:
         print_report(state, data, int(index[0]) if len(index) else -1)
         return
 
-    # ── detect and process all missed candles in order ───────────────────
-    missed = get_missed_candles(data, last_processed, latest_closed_timestamp)
+    # ── traverse backwards to find where we left off ─────────────────────
+    start_index = find_start_index(data, last_processed, latest_closed_timestamp)
 
-    if len(missed) > 1:
+    # find the index of latest_closed_timestamp
+    latest_idx_arr = data["BTCUSDT"].index[
+        data["BTCUSDT"]["timestamp"] == latest_closed_timestamp
+    ]
+    if len(latest_idx_arr) == 0:
+        raise RuntimeError("Failed to locate the latest closed candle.")
+    latest_idx = int(latest_idx_arr[0])
+
+    # build the list of candle indices to process: start_index → latest_idx
+    candles_to_process = list(range(start_index, latest_idx + 1))
+
+    if len(candles_to_process) > 1:
         logger.warning(
-            "CATCHUP: %d missed candles detected since last processed (%s).",
-            len(missed), last_processed,
+            "CATCHUP: processing %d candles from index %d to %d.",
+            len(candles_to_process), start_index, latest_idx,
         )
 
-    for candle_ts in missed:
+    # ── process each candle forward in order ─────────────────────────────
+    for candle_idx in candles_to_process:
+        candle_ts  = data["BTCUSDT"]["timestamp"].iloc[candle_idx]
         candle_iso = candle_ts.isoformat()
 
-        # skip candle that was previously attempted but never completed
-        if (
-            last_attempted == candle_iso
-            and state.get("last_processed_candle") != candle_iso
-            and candle_ts != latest_closed_timestamp
-        ):
-            logger.warning(
-                "Candle %s was attempted but not completed. Skipping.", candle_iso
-            )
-            continue
-
-        process_single_candle(state, data, candle_ts)
+        process_single_candle(state, data, candle_idx)
         logger.info(
             "Candle %s done. Equity=%.4f  Positions=%s",
-            candle_iso, float(state["equity"]), list(state["positions"].keys()),
+            candle_iso, float(state["equity"]),
+            list(state["positions"].keys()),
         )
 
     # ── final report ─────────────────────────────────────────────────────
-    index = data["BTCUSDT"].index[
-        data["BTCUSDT"]["timestamp"] == latest_closed_timestamp
-    ]
-    print_report(state, data, int(index[0]) if len(index) else -1)
+    print_report(state, data, latest_idx)
 
 
 if __name__ == "__main__":
