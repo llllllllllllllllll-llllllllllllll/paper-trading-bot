@@ -376,6 +376,20 @@ def process_entries(state: Dict[str, Any], data: Dict[str, pd.DataFrame],
     if len(state["positions"]) >= MAX_POSITIONS:
         return
 
+    btc_df = data["BTCUSDT"]
+    btc_row = btc_df.iloc[index]
+
+    btc_volatility = float(btc_row["atr"]) > float(btc_row["atr_median"])
+
+    if index < 10:
+        return
+
+    btc_trend = float(btc_row["ema_4h"]) > float(btc_df["ema_4h"].iloc[index - 10])
+
+    if not (btc_volatility and btc_trend):
+        logger.info(f"[REGIME BLOCK] Skipping entries due to BTC regime at index {index}")
+        return
+
     total_open_risk = position_open_risk(state)
     equity          = float(state["equity"])
 
@@ -556,41 +570,22 @@ def find_start_index(
     last_processed: Optional[str],
     latest_closed_timestamp: pd.Timestamp,
 ) -> int:
-    """
-    Traverse backwards through BTC candles to find the index
-    immediately after last_processed_candle.
-
-    Logic
-    -----
-    1. Get all candle timestamps up to latest_closed_timestamp.
-    2. Walk backwards one by one.
-    3. Stop when a candle timestamp equals last_processed.
-    4. Return the index of the candle AFTER that match
-       — that is the first candle we need to process.
-
-    If last_processed is None (fresh start), return the first
-    candle index that satisfies MIN_LOOKBACK.
-    """
     btc_df     = data["BTCUSDT"]
     timestamps = btc_df["timestamp"]
 
-    # find the index of latest_closed_timestamp
     latest_idx_arr = btc_df.index[timestamps == latest_closed_timestamp]
     if len(latest_idx_arr) == 0:
         raise RuntimeError("latest_closed_timestamp not found in BTC data.")
     latest_idx = int(latest_idx_arr[0])
 
-    # fresh start — no previous candle recorded
     if last_processed is None:
         logger.info("No previous candle found. Starting from MIN_LOOKBACK.")
         return MIN_LOOKBACK
 
     last_ts = pd.Timestamp(last_processed)
 
-    # traverse backwards from latest_idx to find last_processed
     for idx in range(latest_idx, -1, -1):
         if timestamps.iloc[idx] == last_ts:
-            # found it — next candle is idx+1
             start = idx + 1
             logger.info(
                 "Found last_processed at index %d (%s). "
@@ -599,8 +594,6 @@ def find_start_index(
             )
             return start
 
-    # last_processed is older than all fetched candles
-    # (e.g. bot was offline for >300 hours)
     logger.warning(
         "last_processed (%s) not found in fetched candle window. "
         "Starting from MIN_LOOKBACK.",
@@ -614,7 +607,6 @@ def process_single_candle(
     data: Dict[str, pd.DataFrame],
     candle_index: int,
 ) -> None:
-    """Run exits → entries → pyramiding for one candle index."""
     candle_ts  = data["BTCUSDT"]["timestamp"].iloc[candle_index]
     candle_iso = candle_ts.isoformat()
 
@@ -653,7 +645,6 @@ def main() -> None:
     latest_closed_iso = latest_closed_timestamp.isoformat()
     last_processed    = state.get("last_processed_candle")
 
-    # ── already fully up to date ─────────────────────────────────────────
     if last_processed == latest_closed_iso:
         logger.info("Already up to date (%s). Showing report.", latest_closed_iso)
         index = data["BTCUSDT"].index[
@@ -662,10 +653,8 @@ def main() -> None:
         print_report(state, data, int(index[0]) if len(index) else -1)
         return
 
-    # ── traverse backwards to find where we left off ─────────────────────
     start_index = find_start_index(data, last_processed, latest_closed_timestamp)
 
-    # find the index of latest_closed_timestamp
     latest_idx_arr = data["BTCUSDT"].index[
         data["BTCUSDT"]["timestamp"] == latest_closed_timestamp
     ]
@@ -673,7 +662,6 @@ def main() -> None:
         raise RuntimeError("Failed to locate the latest closed candle.")
     latest_idx = int(latest_idx_arr[0])
 
-    # build the list of candle indices to process: start_index → latest_idx
     candles_to_process = list(range(start_index, latest_idx + 1))
 
     if len(candles_to_process) > 1:
@@ -682,7 +670,6 @@ def main() -> None:
             len(candles_to_process), start_index, latest_idx,
         )
 
-    # ── process each candle forward in order ─────────────────────────────
     for candle_idx in candles_to_process:
         candle_ts  = data["BTCUSDT"]["timestamp"].iloc[candle_idx]
         candle_iso = candle_ts.isoformat()
@@ -694,7 +681,6 @@ def main() -> None:
             list(state["positions"].keys()),
         )
 
-    # ── final report ─────────────────────────────────────────────────────
     print_report(state, data, latest_idx)
 
 
